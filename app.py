@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
+from collections import defaultdict
 from urllib.parse import urlparse, unquote
 from utils import normalize_url, is_preview_url, get_all_links
 from checkers import (
@@ -247,15 +248,15 @@ def main():
     # バージョン情報と変更履歴
     with st.expander("📋 バージョン情報と変更履歴"):
         st.write("""
-        **現在のバージョン: v1.0.0** 🚀 (2024.11.26 リリース)
+        **現在のバージョン: v1.1.0** 🚀 (2025.12.22 リリース)
         
         **変更履歴：**
+        - v1.1.0 (2025.12.22)
+          - 🧭 404タブに「リンク元（404リンクがあるページ）」を表示
+          - 🈺 404タブの見出しと値を日本語表記に整理
         - v1.0.0 (2024.11.26)
           - ✨ 初回リリース
           - 🎯 基本的なSEO要素チェック機能を実装
-        - v0.9.0 (2024.11.25)
-          - 🔧 ベータ版リリース
-          - 🧪 テスト運用開始
         """)
     
     # チェック項目
@@ -306,6 +307,7 @@ def main():
             # 訪問済みURLを管理
             visited_urls = set()
             urls_to_visit = {url}
+            link_sources = defaultdict(set)  # あるURLをどのページから辿ったか
             results = []
             not_found_pages = []  # 404ページを記録
             
@@ -324,7 +326,10 @@ def main():
                     
                     # 404エラーのページを記録
                     if page_info and page_info.get('status_code') == 404:
-                        not_found_pages.append(page_info)
+                        not_found_pages.append({
+                            **page_info,
+                            'linked_from': sorted(link_sources.get(normalized_current_url, []))
+                        })
                     # 404以外のページを結果に追加
                     elif page_info is not None:
                         results.append(page_info)
@@ -335,6 +340,9 @@ def main():
                             response = requests.get(current_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
                             soup = BeautifulSoup(response.text, 'html.parser')
                             new_links = get_all_links(current_url, base_domain, soup)
+                            # どのページから辿れるリンクか記録
+                            for link in new_links:
+                                link_sources[link].add(normalized_current_url)
                             urls_to_visit.update(new_links - visited_urls)
                         except Exception:
                             pass
@@ -588,7 +596,31 @@ def main():
                         not_found_df['url'] = not_found_df['url'].apply(
                             lambda x: f'<a href="{x}" target="_blank">{unquote(x, encoding="utf-8")}</a>'
                         )
-                        st.write(not_found_df[['url']].to_html(escape=False, index=False), unsafe_allow_html=True)
+                        if 'linked_from' in not_found_df.columns:
+                            not_found_df['linked_from'] = not_found_df['linked_from'].apply(
+                                lambda lst: (
+                                    '<br>'.join(
+                                        f'<a href="{u}" target="_blank">{unquote(u, encoding="utf-8")}</a>'
+                                        for u in (lst if isinstance(lst, (list, set, tuple)) else [])
+                                    ) if lst else 'リンク元なし'
+                                )
+                            )
+                            st.write(
+                                not_found_df[['url', 'linked_from']]
+                                .rename(columns={
+                                    'url': '404ページのURL',
+                                    'linked_from': 'リンク元（404リンクがあるページ）'
+                                })
+                                .to_html(escape=False, index=False),
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.write(
+                                not_found_df[['url']]
+                                .rename(columns={'url': '404ページのURL'})
+                                .to_html(escape=False, index=False),
+                                unsafe_allow_html=True
+                            )
                     else:
                         st.write(" 404エラーページは見つかりませんでした。")
             else:

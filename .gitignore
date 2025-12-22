@@ -27,3 +27,6 @@ env/
 # System files
 .DS_Store
 Thumbs.db 
+
+# Netlify static version (Streamlitのみ運用時は不要)
+netlify_site/
