@@ -501,13 +501,20 @@ def main():
                         lambda x: f'<a href="{x}" target="_blank">{unquote(x, encoding="utf-8")}</a>'
                     )
                     # 画像URLをクリック可能なリンクに変換
-                    display_df4['images_without_alt'] = display_df4['images_without_alt'].apply(
-                        lambda x: x if x in ['✅ OK', '- 画像なし', 'skip'] else
-                        '<br>'.join([
-                            f'{line.split(": ")[0]}: <a href="{line.split(": ")[1]}" target="_blank">{line.split(": ")[1]}</a>'
-                            for line in x.split('\n')[1:]  # 最初の行（❌ alt属性なし:）をスキップ
-                        ])
-                    )
+                    def _format_alt_lines(x):
+                        if x in ['✅ OK', '- 画像なし', 'skip']:
+                            return x
+                        parts = []
+                        for line in x.split('\n')[1:]:
+                            split = line.split(": ", 1)
+                            if len(split) >= 2:
+                                label, url = split[0], split[1]
+                                parts.append(f'{label}: <a href="{url}" target="_blank">{url}</a>')
+                            elif line.strip():
+                                parts.append(line)
+                        return '<br>'.join(parts)
+
+                    display_df4['images_without_alt'] = display_df4['images_without_alt'].apply(_format_alt_lines)
                     st.write(display_df4[['url', 'images_without_alt']].to_html(escape=False, index=False), unsafe_allow_html=True)
                 
                 with tab5:
