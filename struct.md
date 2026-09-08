@@ -135,21 +135,79 @@
   - エラー内容を階層的に表示
   - 重複キーワードは番号付きリストで表示
 
-## 4. エラー処理
-- リクエストエラーの処理
-- 404エラーの特別処理
+## 4. クロール処理（app.py）
+
+### 4.1 get_session()
+- `@st.cache_resource` で1セッション1インスタンス
+- ブラウザ相当のUser-Agent / Accept / Accept-Language を設定
+- `Retry(total=3, backoff_factor=1.5, status_forcelist=[429,500,502,503,504])`
+  - 待機を 1.5秒 → 3秒 → 6秒 と伸ばしながら再試行
+
+### 4.2 fetch_page(url)
+- 前回リクエストから `REQUEST_INTERVAL`（0.5秒）空けてから取得
+- タイムアウトは `(接続15秒, 読み込み30秒)` のタプル指定
+- 404はそのままレスポンスを返す（呼び出し側で専用の結果を作るため）
+- Content-Type に `html` を含まないもの（画像・PDF等）は `None` を返してスキップ
+
+### 4.3 report_error(url, kind, error)
+- `kind` は `connection`（接続失敗）と `request`（HTTPエラー等）の2種類
+- 同じ種類のエラーは最初の1件だけ原因と対処法まで詳しく表示し、
+  2件目以降は1行に要約する
+- `connection` が `MAX_CONSECUTIVE_FAILURES`（5回）連続したら中断を通知
+
+### 4.4 クロールループの打ち切り条件
+- 接続エラーが5回連続 → 打ち切り
+- 取得ページ数が `MAX_PAGES`（300）に到達 → 打ち切り（警告を表示）
+
+### 4.5 リクエスト数の削減
+- `get_page_info()` は `(結果の辞書, BeautifulSoup)` のタプルを返す
+- リンク抽出は取得済みの soup を使い回すため、
+  1ページにつき1リクエストで済む（以前は解析用とリンク抽出用で2回取得していた）
+
+## 5. エラー処理
+- 接続エラー（ConnectionError / Timeout）とHTTPエラーを分けて処理
+- 404エラーの特別処理（リンク元ページも記録）
 - エンコーディング自動検出
-- タイムアウト設定
 - 日本語URLのエンコーディングエラー処理
 
-## 5. 制限事項
+## 6. 制限事項
 - 同一ドメインのみチェック
 - プレビューURLはスキップ
-- PDFファイルはスキップ
+- PDF・画像などHTML以外のファイルはスキップ
 - ブログ・カテゴリーページでの画像チェックはスキップ
+- 1回のチェックは最大300ページまで
 
-## 6. パフォーマンス考慮事項
-- タイムアウト設定（10秒）
-- User-Agentヘッダーの設定
-- エンコーディング自動検出
-- 結果の上限（50件）設定 
+## 7. 実行環境
+
+### 7.1 Streamlit Community Cloud
+- 米国の共有IPから通信するため、海外IPを遮断しているレンタルサーバー
+  （エックスサーバー等）のサイトはチェックできない
+- その場合は接続エラーとして原因と対処法を画面に表示する
+
+### 7.2 ローカル実行（推奨）
+- `検品チェック6選_起動_Windows.bat` / `検品チェック6選_起動_Mac.command`
+- 対応Python: **3.10〜3.13**
+  - `requirements.txt` は上限を固定していないため最新版が入るが、
+    `lxml` の上限だけ `<7.0.0` を明示している（4.9系は3.13以降のwheelが無いため）
+- ランチャーの実装上の注意
+  - `.bat` は Shift-JIS(cp932) + CRLF で保存（UTF-8にすると日本語echoが誤認識される）
+  - `.command` は LF（CRLFだと `bad interpreter: /bin/bash^M`）
+  - venvの `activate` は使わず、`.venv` 内のPythonを絶対パスで直接呼ぶ
+  - 起動時に `--server.showEmailPrompt=false --browser.gatherUsageStats=false` を付ける
+    （付けないと初回起動時にメールアドレス入力待ちで止まる）
+
+### 7.3 Windowsのパス長制限（実測メモ）
+streamlit 1.63.0 は同梱テンプレートの階層が深く、wheel内の最長相対パスが
+`streamlit/.agents/skills/developing-with-streamlit/assets/templates/apps/dashboard-seattle-weather/streamlit_app.py`
+の **115文字**ある。
+
+`<フォルダ>\.venv\Lib\site-packages\`（25文字）を足すと、
+MAX_PATH(260) に収めるためのフォルダパス上限は **120文字**。
+`__pycache__/xxx.cpython-313.pyc` まで作ると約95文字まで縮む。
+
+対策としてランチャー側で以下を行っている：
+- `pip install --no-compile` で `__pycache__` を作らせない（上限を120文字に保つ）
+- フォルダパスが **100文字**を超えたら日本語メッセージを出して停止する
+
+超えた場合の症状：
+`OSError: [WinError 206] ファイル名または拡張子が長すぎます` 

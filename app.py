@@ -1,5 +1,8 @@
 import streamlit as st
 import requests
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
@@ -13,8 +16,99 @@ from checkers import (
     check_keyword_repetition
 )
 
+# --- ネットワーク設定 -------------------------------------------------------
+# レンタルサーバーに「攻撃」と誤検知されないよう、間隔を空けて通常のブラウザとして振る舞う
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
+REQUEST_INTERVAL = 0.5        # リクエスト間に空ける秒数
+CONNECT_TIMEOUT = 15          # 接続タイムアウト（秒）
+READ_TIMEOUT = 30             # 読み込みタイムアウト（秒）
+MAX_PAGES = 300               # 1回の検索で取得する最大ページ数
+MAX_CONSECUTIVE_FAILURES = 5  # 連続でこの回数失敗したら検索を打ち切る
+
+last_request_time = 0.0
+consecutive_failures = 0
+reported_error_kinds = set()
+
+
+@st.cache_resource
+def get_session():
+    """User-Agentとリトライ設定を持つrequestsセッションを作る"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    })
+    retry = Retry(
+        total=3,
+        connect=1,           # 接続自体の失敗は再試行しても無駄なので1回だけ
+        backoff_factor=1.5,  # 1.5秒 → 3秒 → 6秒 と待機を伸ばして再試行
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=['GET'],
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
+
+
+def fetch_page(url):
+    """1ページ取得する。前回リクエストから一定時間空け、HTML以外はNoneを返す。
+    404は呼び出し側で専用の結果を作るため、そのままレスポンスを返す。"""
+    global last_request_time, consecutive_failures
+
+    elapsed = time.time() - last_request_time
+    if elapsed < REQUEST_INTERVAL:
+        time.sleep(REQUEST_INTERVAL - elapsed)
+    last_request_time = time.time()
+
+    response = get_session().get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    consecutive_failures = 0  # 接続できたので連続失敗のカウントをリセット
+
+    if response.status_code == 404:
+        return response
+    response.raise_for_status()
+
+    # 画像やPDFなどHTML以外は解析対象外
+    if 'html' not in response.headers.get('Content-Type', '').lower():
+        return None
+    return response
+
+
+def report_error(url, kind, error):
+    """エラーを表示する。同じ種類のエラーは最初の1件だけ詳しく出す"""
+    global consecutive_failures
+
+    if kind == 'connection':
+        consecutive_failures += 1
+
+    decoded_url = unquote(url) if url else '(URL不明)'
+    if kind not in reported_error_kinds:
+        reported_error_kinds.add(kind)
+        if kind == 'connection':
+            st.warning(
+                f"サイトに接続できませんでした: {decoded_url}  \n"
+                f"（{type(error).__name__}）  \n\n"
+                "**相手のサーバーが、このアプリのIPアドレスを遮断している可能性があります。**  \n"
+                "エックスサーバーなどのレンタルサーバーは、短時間に大量のアクセスを検知すると "
+                "送信元IPを自動でブロックします（24時間〜1週間ほどで自動解除されます）。  \n"
+                "Streamlit Cloudは全ユーザー共通の海外IPから通信するため、"
+                "他の人の利用が原因でブロックされている場合もあります。  \n\n"
+                "お急ぎの場合は、お手元のパソコンでこのアプリを起動して実行してください。"
+            )
+        else:
+            st.warning(f"URLへのアクセスエラー: {decoded_url} - {str(error)}")
+    else:
+        st.warning(f"アクセスエラー: {decoded_url} - {type(error).__name__}")
+
+    if kind == 'connection' and consecutive_failures == MAX_CONSECUTIVE_FAILURES:
+        st.error(f"接続エラーが{MAX_CONSECUTIVE_FAILURES}回続いたため、検索を中断しました。")
+
+
 def get_page_info(url):
-    """ページのタイトルとディスクリプションを取得"""
+    """ページのタイトルとディスクリプションを取得。
+    (結果の辞書, BeautifulSoup) を返す。解析対象外のページは (None, None)。"""
     try:
         # プレビューURLの場合はスキップ
         if is_preview_url(url):
@@ -32,13 +126,12 @@ def get_page_info(url):
                 'html_syntax': '- スキップ',
                 'status_code': 0,
                 'related_urls': []  # 関連URLのリストを追加
-            }
+            }, None
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        
+        response = fetch_page(url)
+        if response is None:  # HTML以外のファイルはスキップ
+            return None, None
+
         # エンコーディングの自動検出と設定
         if response.encoding == 'ISO-8859-1':
             response.encoding = response.apparent_encoding
@@ -66,13 +159,14 @@ def get_page_info(url):
                 'html_syntax': '❌ 404エラー',
                 'status_code': 404,
                 'related_urls': []  # 関連URLのリストを追加
-            }
-        
-        response.raise_for_status()
+            }, None
+
         html_content = response.text
         
-        # BeautifulSoupでパース（エンコーディングを指定）
-        soup = BeautifulSoup(html_content, 'html.parser', from_encoding=response.encoding)
+        # BeautifulSoupでパース
+        # html_content は response.text で既にデコード済みの文字列なので
+        # from_encoding は渡さない（渡すと毎回UserWarningが出るだけで無視される）
+        soup = BeautifulSoup(html_content, 'html.parser')
         
         # 正規化されたURLを使用
         normalized_url = normalize_url(url)
@@ -204,25 +298,35 @@ def get_page_info(url):
                 result['related_urls'] = related_urls
         except Exception:
             pass
-        
-        return result
-        
-    except requests.RequestException:
-        return {
-            'url': normalize_url(url),
-            'title': "接続ラー",
-            'description': "接続エラー",
-            'title_length': 0,
-            'description_length': 0,
-            'title_status': '❌ 接続エラー',
-            'description_status': '❌ 接続エラー',
-            'heading_issues': '❌ 接続エラー',
-            'english_only_headings': '❌ 接続エラー',
-            'images_without_alt': '❌ 接続エラー',
-            'html_syntax': '❌ 接続エラー',
-            'status_code': 0,
-            'related_urls': []  # 関連URLのリストを追加
-        }
+
+        return result, soup
+
+    except (requests.ConnectionError, requests.Timeout) as e:
+        # 接続そのものが失敗（サーバー側で遮断されている可能性が高い）
+        report_error(url, 'connection', e)
+        return error_page_info(url), None
+    except requests.RequestException as e:
+        report_error(url, 'request', e)
+        return error_page_info(url), None
+
+
+def error_page_info(url):
+    """接続に失敗したページ用の結果を作る"""
+    return {
+        'url': normalize_url(url),
+        'title': "接続エラー",
+        'description': "接続エラー",
+        'title_length': 0,
+        'description_length': 0,
+        'title_status': '❌ 接続エラー',
+        'description_status': '❌ 接続エラー',
+        'heading_issues': '❌ 接続エラー',
+        'english_only_headings': '❌ 接続エラー',
+        'images_without_alt': '❌ 接続エラー',
+        'html_syntax': '❌ 接続エラー',
+        'status_code': 0,
+        'related_urls': []  # 関連URLのリストを追加
+    }
 
 def main():
     # ページ幅の設定
@@ -248,9 +352,14 @@ def main():
     # バージョン情報と変更履歴
     with st.expander("📋 バージョン情報と変更履歴"):
         st.write("""
-        **現在のバージョン: v1.1.1** 🚀 (2026.03.12 リリース)
-        
+        **現在のバージョン: v1.2.0** 🚀 (2026.09.04 リリース)
+
         **変更履歴：**
+        - v1.2.0 (2026.09.04)
+          - 🛡️ サーバーに「攻撃」と誤検知されにくいクロール方式に変更（リクエスト間隔・リトライ・タイムアウト）
+          - ⚡ 同じページを2回取得していた無駄なリクエストを廃止（アクセス数が約半分に）
+          - 💬 接続できないときに、原因と対処法を表示するように改善
+          - 🖥️ パソコンで直接起動できるランチャーを追加（サーバー遮断時の回避策）
         - v1.1.1 (2026.03.12)
           - 🐛 alt属性チェック結果の表示時に発生するエラーを修正
         - v1.1.0 (2025.12.22)
@@ -314,15 +423,25 @@ def main():
             progress_bar = st.progress(0)
             
             while urls_to_visit:
+                # 接続エラーが続いている場合は打ち切る
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    break
+                # 上限ページ数に達した場合は打ち切る
+                if len(visited_urls) >= MAX_PAGES:
+                    st.warning(
+                        f"ページ数が上限（{MAX_PAGES}ページ）に達したため、ここまでの結果を表示します。"
+                    )
+                    break
+
                 current_url = urls_to_visit.pop()
                 normalized_current_url = normalize_url(current_url)
-                
+
                 if normalized_current_url not in visited_urls:
                     visited_urls.add(normalized_current_url)
-                    
-                    # ページ情報の取得
-                    page_info = get_page_info(current_url)
-                    
+
+                    # ページ情報の取得（リンク抽出用のsoupも同時に受け取る）
+                    page_info, soup = get_page_info(current_url)
+
                     # 404エラーのページを記録
                     if page_info and page_info.get('status_code') == 404:
                         not_found_pages.append({
@@ -332,12 +451,10 @@ def main():
                     # 404以外のページを結果に追加
                     elif page_info is not None:
                         results.append(page_info)
-                    
-                    # 新しいリンクの取得（404ページ以外）
-                    if page_info and page_info.get('status_code') != 404:
+
+                    # 新しいリンクの取得（取得済みのsoupを使い回して再リクエストしない）
+                    if soup is not None and page_info and page_info.get('status_code') != 404:
                         try:
-                            response = requests.get(current_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-                            soup = BeautifulSoup(response.text, 'html.parser')
                             new_links = get_all_links(current_url, base_domain, soup)
                             # どのページから辿れるリンクか記録
                             for link in new_links:
@@ -345,7 +462,7 @@ def main():
                             urls_to_visit.update(new_links - visited_urls)
                         except Exception:
                             pass
-                
+
                 # プログレスバーの更新
                 progress = len(visited_urls) / (len(visited_urls) + len(urls_to_visit))
                 progress_bar.progress(min(progress, 1.0))

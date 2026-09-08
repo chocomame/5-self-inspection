@@ -12,6 +12,7 @@ build/
 venv/
 env/
 .env/
+.venv/
 
 # IDE
 .vscode/
@@ -34,3 +35,14 @@ Thumbs.db
 
 # Netlify static version (Streamlitのみ運用時は不要)
 netlify_site/
+
+# ローカル起動用ランチャー一式（手渡しで配布するため、GitHubには上げない）
+# ※将来これらをGitに入れる場合は .gitattributes で必ず改行コードを固定すること。
+#   *.bat     text eol=crlf   （中身は Shift-JIS(cp932) で保存）
+#   *.command text eol=lf
+#   core.autocrlf=true のため、指定しないと .command がCRLFに変換され、
+#   macOSで bad interpreter: /bin/bash^M になって起動しなくなる。
+.gitattributes
+検品チェック6選_起動_Windows.bat
+検品チェック6選_起動_Mac.command
+はじめにお読みください.txt
